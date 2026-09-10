@@ -3,7 +3,7 @@ name: Build APK
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, duo-mirror-v2 ]
 
 jobs:
   build:
@@ -44,5 +44,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: ContinuityMotion-debug-apk
+          name: ContinuityMotion-DuoMirror-v2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
