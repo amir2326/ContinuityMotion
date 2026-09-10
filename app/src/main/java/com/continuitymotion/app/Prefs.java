@@ -5,20 +5,20 @@ import android.content.SharedPreferences;
 
 final class Prefs {
     private static final String FILE = "motion";
-    private static final int PRESET_VERSION = 2;
+    private static final int PRESET_VERSION = 3;
     private Prefs() {}
 
     static float blur(Context c) {
-        return prefs(c).getFloat("blur", 30f);
+        return prefs(c).getFloat("blur", 32f);
     }
     static float perspective(Context c) {
-        return prefs(c).getFloat("perspective", 1.5f);
+        return prefs(c).getFloat("perspective", 1.0f);
     }
     static float compression(Context c) {
-        return prefs(c).getFloat("compression", 0.016f);
+        return prefs(c).getFloat("compression", 0.012f);
     }
     static float haze(Context c) {
-        return prefs(c).getFloat("haze", 0.025f);
+        return prefs(c).getFloat("haze", 0f);
     }
 
     static void setBlur(Context c, float v) { prefs(c).edit().putFloat("blur", v).apply(); }
@@ -29,25 +29,22 @@ final class Prefs {
     static void applyDuoPreset(Context c) {
         c.getSharedPreferences(FILE, Context.MODE_PRIVATE).edit()
                 .putInt("preset_version", PRESET_VERSION)
-                .putFloat("blur", 30f)
-                .putFloat("perspective", 1.5f)
-                .putFloat("compression", 0.016f)
-                .putFloat("haze", 0.025f)
+                .putFloat("blur", 32f)
+                .putFloat("perspective", 1.0f)
+                .putFloat("compression", 0.012f)
+                .putFloat("haze", 0f)
                 .apply();
     }
 
     private static SharedPreferences prefs(Context c) {
         SharedPreferences p = c.getSharedPreferences(FILE, Context.MODE_PRIVATE);
         if (p.getInt("preset_version", 0) < PRESET_VERSION) {
-            // v0.1's tuning centered blur at 90 degrees and used much stronger
-            // perspective/haze. Migrate existing installs to the new reference
-            // preset once so upgrading the APK actually changes the motion.
             p.edit()
                     .putInt("preset_version", PRESET_VERSION)
-                    .putFloat("blur", 30f)
-                    .putFloat("perspective", 1.5f)
-                    .putFloat("compression", 0.016f)
-                    .putFloat("haze", 0.025f)
+                    .putFloat("blur", 32f)
+                    .putFloat("perspective", 1.0f)
+                    .putFloat("compression", 0.012f)
+                    .putFloat("haze", 0f)
                     .apply();
         }
         return p;
