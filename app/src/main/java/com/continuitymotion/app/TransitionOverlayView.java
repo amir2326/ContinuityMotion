@@ -2,60 +2,98 @@ package com.continuitymotion.app;
 
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.graphics.Camera;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.RectF;
-import android.graphics.RenderEffect;
-import android.graphics.Shader;
-import android.os.Build;
+import android.view.Choreographer;
 import android.view.View;
 
 final class TransitionOverlayView extends View {
-    private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
-    private final Paint hazePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Camera camera = new Camera();
-    private final Matrix matrix = new Matrix();
+    private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
+    private final Paint veilPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Matrix transform = new Matrix();
+    private final RectF dst = new RectF();
+
     private Bitmap screenshot;
-    private float angle = 180f;
-    private float velocity = 0f;
-    private final float density;
+    private Bitmap mediumBlur;
+    private Bitmap heavyBlur;
+
+    private float targetAngle = 180f;
+    private float displayedAngle = 180f;
+    private float sensorVelocity = 0f;
+    private float direction = 1f;
+    private boolean angleInitialized = false;
+    private boolean framePosted = false;
+    private long lastFrameNanos = 0L;
 
     TransitionOverlayView(Context context) {
         super(context);
-        density = getResources().getDisplayMetrics().density;
         setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        setBackgroundColor(Color.BLACK);
+        setBackgroundColor(Color.TRANSPARENT);
     }
 
     void setScreenshot(Bitmap bitmap) {
-        Bitmap old = screenshot;
+        recycleBitmaps();
         screenshot = bitmap;
-        if (old != null && old != bitmap && !old.isRecycled()) old.recycle();
+
+        // Progressive blur is generated only once per fold gesture. Drawing
+        // these tiny cached layers is much cheaper than rebuilding a full-screen
+        // RenderEffect every time the hinge sensor reports a new angle.
+        mediumBlur = makeScaledBlurLayer(bitmap, 420);
+        heavyBlur = makeScaledBlurLayer(bitmap, 118);
         invalidate();
     }
 
     void setHinge(float hingeAngle, float hingeVelocity) {
-        angle = MotionMath.clamp(hingeAngle, 0f, 180f);
-        velocity = hingeVelocity;
+        targetAngle = MotionMath.clamp(hingeAngle, 0f, 180f);
+        sensorVelocity = hingeVelocity;
+        if (Math.abs(hingeVelocity) > 2f) direction = hingeVelocity >= 0f ? 1f : -1f;
 
-        if (Build.VERSION.SDK_INT >= 31) {
-            float p = MotionMath.normalizeAngle(angle);
-            float bell = MotionMath.bell(p);
-            float radius = Math.max(0.01f, Prefs.blur(getContext()) * bell * density);
-            if (radius < 0.5f) {
-                setRenderEffect(null);
-            } else {
-                setRenderEffect(RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP));
-            }
+        if (!angleInitialized) {
+            displayedAngle = targetAngle;
+            angleInitialized = true;
         }
-        invalidate();
+        requestFrame();
     }
 
+    private void requestFrame() {
+        if (framePosted) return;
+        framePosted = true;
+        Choreographer.getInstance().postFrameCallback(frameCallback);
+    }
+
+    private final Choreographer.FrameCallback frameCallback = frameTimeNanos -> {
+        framePosted = false;
+        if (!isAttachedToWindow()) {
+            lastFrameNanos = 0L;
+            return;
+        }
+
+        if (lastFrameNanos == 0L) {
+            displayedAngle = targetAngle;
+        } else {
+            float dt = (frameTimeNanos - lastFrameNanos) / 1_000_000_000f;
+            dt = MotionMath.clamp(dt, 0.001f, 0.05f);
+
+            // A tiny predictive lead offsets sensor/display pipeline latency,
+            // while the exponential follower suppresses hinge quantization.
+            float predicted = MotionMath.clamp(targetAngle + sensorVelocity * 0.010f, 0f, 180f);
+            float alpha = 1f - (float) Math.exp(-dt / 0.014f);
+            displayedAngle += (predicted - displayedAngle) * alpha;
+        }
+        lastFrameNanos = frameTimeNanos;
+        postInvalidateOnAnimation();
+
+        if (Math.abs(displayedAngle - targetAngle) > 0.04f) requestFrame();
+    };
+
     @Override protected void onDetachedFromWindow() {
-        setRenderEffect(null);
+        if (framePosted) Choreographer.getInstance().removeFrameCallback(frameCallback);
+        framePosted = false;
+        lastFrameNanos = 0L;
+        recycleBitmaps();
         super.onDetachedFromWindow();
     }
 
@@ -63,43 +101,93 @@ final class TransitionOverlayView extends View {
         super.onDraw(canvas);
         if (screenshot == null || screenshot.isRecycled() || getWidth() <= 0 || getHeight() <= 0) return;
 
-        float p = MotionMath.smoothstep(MotionMath.normalizeAngle(angle));
-        float bell = MotionMath.bell(p);
-        float compression = Prefs.compression(getContext()) * bell;
-        float scale = 1f - compression;
-        float rotation = Prefs.perspective(getContext()) * bell;
-        if (velocity < 0f) rotation = -rotation;
+        float envelope = MotionMath.handoffOpacity(displayedAngle);
+        if (envelope < 0.002f) return;
 
-        float cx = getWidth() / 2f;
-        float cy = getHeight() / 2f;
+        float blurStrength = MotionMath.clamp(Prefs.blur(getContext()) / 30f, 0f, 1.2f);
+        float blurMix = MotionMath.clamp(MotionMath.handoffBlur(displayedAngle) * blurStrength, 0f, 1f);
 
-        camera.save();
-        camera.rotateY(rotation);
-        camera.getMatrix(matrix);
-        camera.restore();
-        matrix.preTranslate(-cx, -cy);
-        matrix.postTranslate(cx, cy);
-        matrix.postScale(scale, scale, cx, cy);
+        // Unlike v0.1, never shrink away from the edges. A tiny zoom lets the
+        // source crop naturally morph as Samsung resizes the overlay from cover
+        // to inner display, while avoiding black borders or a visible rectangle.
+        float zoom = 1f + Prefs.compression(getContext()) * envelope;
+        float perspectiveSqueeze = Prefs.perspective(getContext()) * 0.0010f * envelope;
+        float scaleX = zoom * (1f - perspectiveSqueeze);
+        float scaleY = zoom;
+        float driftX = direction * getWidth() * 0.0028f * envelope;
 
-        float sourceAspect = screenshot.getWidth() / (float) screenshot.getHeight();
-        float viewAspect = getWidth() / (float) getHeight();
-        RectF dst;
-        if (sourceAspect > viewAspect) {
-            float w = getHeight() * sourceAspect;
-            dst = new RectF((getWidth() - w) / 2f, 0f, (getWidth() + w) / 2f, getHeight());
-        } else {
-            float h = getWidth() / sourceAspect;
-            dst = new RectF(0f, (getHeight() - h) / 2f, getWidth(), (getHeight() + h) / 2f);
-        }
+        float cx = getWidth() * 0.5f;
+        float cy = getHeight() * 0.5f;
+        transform.reset();
+        transform.setScale(scaleX, scaleY, cx, cy);
+        transform.postTranslate(driftX, 0f);
+
+        centerCropRect(screenshot, dst);
+
+        // The destination screen remains live underneath. At peak handoff we
+        // intentionally leave ~12% visible, producing the translucent
+        // "see-through" continuity seen in Duo demonstrations.
+        int overlayAlpha = Math.round(255f * 0.88f * envelope);
 
         int save = canvas.save();
-        canvas.concat(matrix);
-        imagePaint.setAlpha((int) (255f * (1f - 0.05f * bell)));
-        canvas.drawBitmap(screenshot, null, dst, imagePaint);
+        canvas.concat(transform);
+        if (blurMix < 0.52f) {
+            float t = blurMix / 0.52f;
+            drawLayer(canvas, screenshot, dst, overlayAlpha * (1f - t));
+            drawLayer(canvas, mediumBlur, dst, overlayAlpha * t);
+        } else {
+            float t = (blurMix - 0.52f) / 0.48f;
+            drawLayer(canvas, mediumBlur, dst, overlayAlpha * (1f - t));
+            drawLayer(canvas, heavyBlur, dst, overlayAlpha * t);
+        }
         canvas.restoreToCount(save);
 
-        int alpha = (int) (255f * Prefs.haze(getContext()) * bell);
-        hazePaint.setColor(Color.argb(alpha, 235, 235, 242));
-        canvas.drawRect(0f, 0f, getWidth(), getHeight(), hazePaint);
+        // Very subtle neutral veil only at the handoff. The old bright haze was
+        // deliberately removed because it looked milky rather than optical.
+        int veilAlpha = Math.round(255f * Prefs.haze(getContext()) * envelope);
+        if (veilAlpha > 0) {
+            veilPaint.setColor(Color.argb(veilAlpha, 20, 22, 28));
+            canvas.drawRect(0f, 0f, getWidth(), getHeight(), veilPaint);
+        }
+    }
+
+    private void centerCropRect(Bitmap source, RectF out) {
+        float sourceAspect = source.getWidth() / (float) source.getHeight();
+        float viewAspect = getWidth() / (float) getHeight();
+        if (sourceAspect > viewAspect) {
+            float width = getHeight() * sourceAspect;
+            out.set((getWidth() - width) * 0.5f, 0f, (getWidth() + width) * 0.5f, getHeight());
+        } else {
+            float height = getWidth() / sourceAspect;
+            out.set(0f, (getHeight() - height) * 0.5f, getWidth(), (getHeight() + height) * 0.5f);
+        }
+    }
+
+    private void drawLayer(Canvas canvas, Bitmap bitmap, RectF rect, float alpha) {
+        if (bitmap == null || bitmap.isRecycled() || alpha <= 0.5f) return;
+        imagePaint.setAlpha(Math.round(MotionMath.clamp(alpha, 0f, 255f)));
+        canvas.drawBitmap(bitmap, null, rect, imagePaint);
+    }
+
+    private Bitmap makeScaledBlurLayer(Bitmap source, int maxLongSide) {
+        int sw = source.getWidth();
+        int sh = source.getHeight();
+        int longest = Math.max(sw, sh);
+        float scale = Math.min(1f, maxLongSide / (float) longest);
+        int w = Math.max(20, Math.round(sw * scale));
+        int h = Math.max(20, Math.round(sh * scale));
+        return Bitmap.createScaledBitmap(source, w, h, true);
+    }
+
+    private void recycleBitmaps() {
+        Bitmap oldScreenshot = screenshot;
+        Bitmap oldMedium = mediumBlur;
+        Bitmap oldHeavy = heavyBlur;
+        screenshot = null;
+        mediumBlur = null;
+        heavyBlur = null;
+        if (oldMedium != null && oldMedium != oldScreenshot && !oldMedium.isRecycled()) oldMedium.recycle();
+        if (oldHeavy != null && oldHeavy != oldScreenshot && oldHeavy != oldMedium && !oldHeavy.isRecycled()) oldHeavy.recycle();
+        if (oldScreenshot != null && !oldScreenshot.isRecycled()) oldScreenshot.recycle();
     }
 }
