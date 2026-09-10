@@ -16,11 +16,13 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
     private FoldSensor foldSensor;
     private WindowManager windowManager;
     private TransitionOverlayView overlay;
+    private Bitmap capturedFrame;
     private boolean captureInFlight;
+    private boolean endpointRevealStarted;
     private float pendingAngle = 180f;
     private float pendingVelocity = 0f;
-    private long lastMotionMillis = 0L;
-    private long lastCaptureAttemptMillis = 0L;
+    private long lastMotionMillis;
+    private long lastCaptureAttemptMillis;
     private final Handler main = new Handler(Looper.getMainLooper());
 
     @Override protected void onServiceConnected() {
@@ -32,40 +34,50 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
 
     @Override public void onDestroy() {
         if (foldSensor != null) foldSensor.stop();
-        removeOverlay();
+        removeOverlayAndFrame();
         super.onDestroy();
     }
 
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        // Window/display changes are intentionally allowed to resize the same
+        // accessibility overlay. TransitionOverlayView detects that geometry
+        // change and performs the second half of the handoff animation.
+    }
+
     @Override public void onInterrupt() { }
 
     @Override public void onHingeAngle(float angle, float velocity) {
         pendingAngle = angle;
         pendingVelocity = velocity;
         long now = SystemClock.uptimeMillis();
-        boolean moving = Math.abs(velocity) > 1.5f;
-        if (moving) lastMotionMillis = now;
+        boolean moving = Math.abs(velocity) > 1.0f;
+        boolean betweenEndpoints = angle > 0.35f && angle < 179.65f;
 
-        // Start capturing almost immediately after the hinge leaves an endpoint.
-        // v0.1 waited until 6 degrees, so the first rendered frame often arrived
-        // visibly late. Keeping the overlay transparent outside the handoff band
-        // means it can safely be prepared well in advance.
-        boolean gestureActive = angle > 0.6f && angle < 179.4f;
-        if (gestureActive && moving) {
-            if (overlay == null && !captureInFlight && now - lastCaptureAttemptMillis > 280L) {
-                captureFrame();
-            }
+        if (moving) {
+            lastMotionMillis = now;
+            if (betweenEndpoints) endpointRevealStarted = false;
+        }
+
+        // Capture at the very beginning of the physical gesture. The overlay
+        // itself is visually identical to the live screen at first, so there is
+        // no flash while the morph engine is being prepared.
+        if (betweenEndpoints && moving && overlay == null && !captureInFlight
+                && now - lastCaptureAttemptMillis > 220L) {
+            captureFrame();
         }
 
         if (overlay != null) overlay.setHinge(angle, velocity);
 
-        boolean atEndpoint = angle <= 1.8f || angle >= 178.2f;
-        if (atEndpoint) {
+        boolean endpoint = angle <= 1.4f || angle >= 178.6f;
+        if (endpoint && overlay != null && !endpointRevealStarted) {
+            endpointRevealStarted = true;
+            overlay.beginFinalReveal();
             main.postDelayed(() -> {
-                long idle = SystemClock.uptimeMillis() - lastMotionMillis;
-                boolean stillAtEndpoint = pendingAngle <= 1.8f || pendingAngle >= 178.2f;
-                if (stillAtEndpoint && idle >= 130L) removeOverlay();
-            }, 145L);
+                boolean stillEndpoint = pendingAngle <= 2.2f || pendingAngle >= 177.8f;
+                if (stillEndpoint && SystemClock.uptimeMillis() - lastMotionMillis > 120L) {
+                    removeOverlayAndFrame();
+                }
+            }, 330L);
         }
     }
 
@@ -85,12 +97,16 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                     buffer.close();
                 }
 
-                if (software != null && pendingAngle > 0.4f && pendingAngle < 179.6f) {
-                    showOverlay(software);
-                    if (overlay != null) overlay.setHinge(pendingAngle, pendingVelocity);
-                } else if (software != null) {
+                if (software == null) return;
+                if (pendingAngle <= 0.2f || pendingAngle >= 179.8f) {
                     software.recycle();
+                    return;
                 }
+
+                if (capturedFrame != null && !capturedFrame.isRecycled()) capturedFrame.recycle();
+                capturedFrame = software;
+                showOverlay();
+                if (overlay != null) overlay.setHinge(pendingAngle, pendingVelocity);
             }
 
             @Override public void onFailure(int errorCode) {
@@ -99,11 +115,8 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         });
     }
 
-    private void showOverlay(Bitmap bitmap) {
-        if (windowManager == null) {
-            bitmap.recycle();
-            return;
-        }
+    private void showOverlay() {
+        if (windowManager == null || capturedFrame == null || capturedFrame.isRecycled()) return;
         if (overlay == null) {
             overlay = new TransitionOverlayView(this);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
@@ -117,23 +130,25 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                     android.graphics.PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.START;
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-            lp.setTitle("Continuity Motion handoff");
+            lp.setTitle("Continuity Motion panel handoff");
             try {
                 windowManager.addView(overlay, lp);
             } catch (RuntimeException e) {
                 overlay = null;
-                bitmap.recycle();
                 return;
             }
         }
-        overlay.setScreenshot(bitmap);
+        overlay.setScreenshot(capturedFrame);
     }
 
-    private void removeOverlay() {
+    private void removeOverlayAndFrame() {
         captureInFlight = false;
+        endpointRevealStarted = false;
         if (overlay != null && windowManager != null) {
             try { windowManager.removeViewImmediate(overlay); } catch (RuntimeException ignored) { }
             overlay = null;
         }
+        if (capturedFrame != null && !capturedFrame.isRecycled()) capturedFrame.recycle();
+        capturedFrame = null;
     }
 }
