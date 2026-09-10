@@ -25,6 +25,7 @@ final class TransitionOverlayView extends View {
     private final Paint seamPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint edgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Map<Integer, RenderEffect> blurCache = new HashMap<>();
+    private int appliedBlurRadius = -1;
 
     private Bitmap source;
     private Bitmap target;
@@ -79,7 +80,7 @@ final class TransitionOverlayView extends View {
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
         float cx = w * 0.5f;
-        hingeToRight = new LinearGradient(cx, 0, Math.max(cx + 1f, w),
+        hingeToRight = new LinearGradient(cx, 0, Math.max(cx + 1f, w), 0,
                 new int[]{Color.BLACK, Color.BLACK, Color.TRANSPARENT},
                 new float[]{0f, .18f, 1f}, Shader.TileMode.CLAMP);
         hingeToLeft = new LinearGradient(cx, 0, 0, 0,
@@ -90,6 +91,7 @@ final class TransitionOverlayView extends View {
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (source == null || source.isRecycled() || getWidth() <= 0 || getHeight() <= 0) return;
+        applyViewBlur(currentBlurRadius());
         if (direction == Direction.CLOSING) drawClosing(canvas); else drawOpening(canvas);
         if (handedOff && timeBlend() < 0.999f) postInvalidateOnAnimation();
     }
@@ -97,15 +99,21 @@ final class TransitionOverlayView extends View {
     private void drawClosing(Canvas c) {
         float p = MotionMath.saturate((180f - angle) / 180f);
         float physical = MotionMath.smootherstep(p);
-        if (!handedOff) drawClosingOnInner(c, physical);
-        else drawClosingOnCover(c, physical, timeBlend());
+        if (!handedOff) {
+            drawClosingOnInner(c, physical);
+        } else {
+            drawClosingOnCover(c, physical, timeBlend());
+        }
     }
 
     private void drawOpening(Canvas c) {
         float p = MotionMath.saturate(angle / 180f);
         float physical = MotionMath.smootherstep(p);
-        if (!handedOff) drawOpeningOnCover(c, physical);
-        else drawOpeningOnInner(c, physical, timeBlend());
+        if (!handedOff) {
+            drawOpeningOnCover(c, physical);
+        } else {
+            drawOpeningOnInner(c, physical, timeBlend());
+        }
     }
 
     private void drawClosingOnInner(Canvas c, float p) {
@@ -242,28 +250,47 @@ final class TransitionOverlayView extends View {
         }
     }
 
+    private float currentBlurRadius() {
+        float physical = direction == Direction.CLOSING
+                ? MotionMath.smootherstep(MotionMath.saturate((180f - angle) / 180f))
+                : MotionMath.smootherstep(MotionMath.saturate(angle / 180f));
+        if (!handedOff) {
+            return Prefs.blur(getContext()) * (float) Math.pow(MotionMath.bell(physical), .68);
+        }
+        float t = timeBlend();
+        if (direction == Direction.CLOSING) {
+            return Prefs.blur(getContext()) * .72f * (1f - t);
+        }
+        float angleResolve = MotionMath.smoothstep(MotionMath.remap(physical, .14f, .92f));
+        return Prefs.blur(getContext()) * .82f * (1f - Math.max(t, angleResolve));
+    }
+
+    private void applyViewBlur(float radius) {
+        if (Build.VERSION.SDK_INT < 31) return;
+        int r = Math.round(MotionMath.clamp(radius, 0f, 64f));
+        if (r == appliedBlurRadius) return;
+        appliedBlurRadius = r;
+        if (r <= 0) {
+            setRenderEffect(null);
+            return;
+        }
+        RenderEffect effect = blurCache.get(r);
+        if (effect == null) {
+            effect = RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP);
+            blurCache.put(r, effect);
+        }
+        setRenderEffect(effect);
+    }
+
     private void drawBitmap(Canvas c, Bitmap b, Rect src, RectF dst, float blurRadius, float alpha) {
         imagePaint.setAlpha(Math.round(255f * MotionMath.saturate(alpha)));
-        if (Build.VERSION.SDK_INT >= 31) {
-            int r = Math.round(MotionMath.clamp(blurRadius, 0f, 64f));
-            if (r <= 0) {
-                imagePaint.setRenderEffect(null);
-            } else {
-                RenderEffect effect = blurCache.get(r);
-                if (effect == null) {
-                    effect = RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP);
-                    blurCache.put(r, effect);
-                }
-                imagePaint.setRenderEffect(effect);
-            }
-        }
         c.drawBitmap(b, src, dst, imagePaint);
-        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
         imagePaint.setAlpha(255);
     }
 
     @Override protected void onDetachedFromWindow() {
-        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
+        if (Build.VERSION.SDK_INT >= 31) setRenderEffect(null);
+        appliedBlurRadius = -1;
         super.onDetachedFromWindow();
     }
 }
