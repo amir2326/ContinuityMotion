@@ -6,6 +6,7 @@ import android.graphics.ColorSpace;
 import android.hardware.HardwareBuffer;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.view.Display;
 import android.view.Gravity;
 import android.view.WindowManager;
@@ -19,6 +20,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
     private float pendingAngle = 180f;
     private float pendingVelocity = 0f;
     private long lastMotionMillis = 0L;
+    private long lastCaptureAttemptMillis = 0L;
     private final Handler main = new Handler(Looper.getMainLooper());
 
     @Override protected void onServiceConnected() {
@@ -40,26 +42,36 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
     @Override public void onHingeAngle(float angle, float velocity) {
         pendingAngle = angle;
         pendingVelocity = velocity;
-        long now = android.os.SystemClock.uptimeMillis();
-        boolean moving = Math.abs(velocity) > 5f;
+        long now = SystemClock.uptimeMillis();
+        boolean moving = Math.abs(velocity) > 1.5f;
         if (moving) lastMotionMillis = now;
 
-        boolean inTransition = angle > 6f && angle < 174f;
-        if (inTransition && moving) {
-            if (overlay == null && !captureInFlight) captureFrame();
-            if (overlay != null) overlay.setHinge(angle, velocity);
+        // Start capturing almost immediately after the hinge leaves an endpoint.
+        // v0.1 waited until 6 degrees, so the first rendered frame often arrived
+        // visibly late. Keeping the overlay transparent outside the handoff band
+        // means it can safely be prepared well in advance.
+        boolean gestureActive = angle > 0.6f && angle < 179.4f;
+        if (gestureActive && moving) {
+            if (overlay == null && !captureInFlight && now - lastCaptureAttemptMillis > 280L) {
+                captureFrame();
+            }
         }
 
-        if (!inTransition) {
+        if (overlay != null) overlay.setHinge(angle, velocity);
+
+        boolean atEndpoint = angle <= 1.8f || angle >= 178.2f;
+        if (atEndpoint) {
             main.postDelayed(() -> {
-                long idle = android.os.SystemClock.uptimeMillis() - lastMotionMillis;
-                if ((pendingAngle <= 6f || pendingAngle >= 174f) && idle >= 70L) removeOverlay();
-            }, 80L);
+                long idle = SystemClock.uptimeMillis() - lastMotionMillis;
+                boolean stillAtEndpoint = pendingAngle <= 1.8f || pendingAngle >= 178.2f;
+                if (stillAtEndpoint && idle >= 130L) removeOverlay();
+            }, 145L);
         }
     }
 
     private void captureFrame() {
         captureInFlight = true;
+        lastCaptureAttemptMillis = SystemClock.uptimeMillis();
         takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
             @Override public void onSuccess(ScreenshotResult result) {
                 captureInFlight = false;
@@ -72,9 +84,10 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                 } finally {
                     buffer.close();
                 }
-                if (software != null && pendingAngle > 6f && pendingAngle < 174f) {
+
+                if (software != null && pendingAngle > 0.4f && pendingAngle < 179.6f) {
                     showOverlay(software);
-                    overlay.setHinge(pendingAngle, pendingVelocity);
+                    if (overlay != null) overlay.setHinge(pendingAngle, pendingVelocity);
                 } else if (software != null) {
                     software.recycle();
                 }
@@ -87,7 +100,10 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
     }
 
     private void showOverlay(Bitmap bitmap) {
-        if (windowManager == null) return;
+        if (windowManager == null) {
+            bitmap.recycle();
+            return;
+        }
         if (overlay == null) {
             overlay = new TransitionOverlayView(this);
             WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
@@ -101,12 +117,20 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                     android.graphics.PixelFormat.TRANSLUCENT);
             lp.gravity = Gravity.TOP | Gravity.START;
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-            windowManager.addView(overlay, lp);
+            lp.setTitle("Continuity Motion handoff");
+            try {
+                windowManager.addView(overlay, lp);
+            } catch (RuntimeException e) {
+                overlay = null;
+                bitmap.recycle();
+                return;
+            }
         }
         overlay.setScreenshot(bitmap);
     }
 
     private void removeOverlay() {
+        captureInFlight = false;
         if (overlay != null && windowManager != null) {
             try { windowManager.removeViewImmediate(overlay); } catch (RuntimeException ignored) { }
             overlay = null;
