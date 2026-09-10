@@ -2,9 +2,11 @@ package com.continuitymotion.app;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.Camera;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -20,12 +22,13 @@ import java.util.Map;
 final class TransitionOverlayView extends View {
     enum Direction { OPENING, CLOSING }
 
-    private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
     private final Paint dimPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint seamPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint edgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint sheenPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Camera camera = new Camera();
+    private final Matrix cameraMatrix = new Matrix();
     private final Map<Integer, RenderEffect> blurCache = new HashMap<>();
-    private int appliedBlurRadius = -1;
 
     private Bitmap source;
     private Bitmap target;
@@ -34,8 +37,10 @@ final class TransitionOverlayView extends View {
     private float velocity = 0f;
     private boolean handedOff = false;
     private long handoffMillis = 0L;
+    private long targetArrivedMillis = 0L;
     private LinearGradient hingeToRight;
     private LinearGradient hingeToLeft;
+    private LinearGradient glassToLeft;
 
     TransitionOverlayView(Context context) {
         super(context);
@@ -46,12 +51,16 @@ final class TransitionOverlayView extends View {
     void bind(Bitmap sourceBitmap, Bitmap targetBitmap, Direction d) {
         source = sourceBitmap;
         target = targetBitmap;
+        targetArrivedMillis = targetBitmap == null ? 0L : SystemClock.uptimeMillis();
         direction = d;
+        handedOff = false;
+        handoffMillis = 0L;
         invalidate();
     }
 
     void setTarget(Bitmap targetBitmap) {
         target = targetBitmap;
+        targetArrivedMillis = targetBitmap == null ? 0L : SystemClock.uptimeMillis();
         invalidate();
     }
 
@@ -71,10 +80,21 @@ final class TransitionOverlayView extends View {
 
     boolean isHandedOff() { return handedOff; }
 
-    private float timeBlend() {
-        if (!handedOff) return 0f;
-        float t = (SystemClock.uptimeMillis() - handoffMillis) / (float) Math.max(120, Prefs.handoffMs(getContext()));
+    private float targetBlend() {
+        if (!handedOff || target == null || target.isRecycled()) return 0f;
+        long start = Math.max(handoffMillis, targetArrivedMillis);
+        float t = (SystemClock.uptimeMillis() - start) / (float) Math.max(120, Prefs.handoffMs(getContext()));
         return MotionMath.smootherstep(t);
+    }
+
+    private float visualAngle() {
+        // Small forward prediction removes the perceptible sensor/render pipeline lag at fast fold speeds.
+        float lead = MotionMath.clamp(velocity * 0.018f, -3.4f, 3.4f);
+        return MotionMath.clamp(angle + lead, 0f, 180f);
+    }
+
+    private float speedBoost() {
+        return MotionMath.smoothstep(MotionMath.remap(Math.abs(velocity), 55f, 420f));
     }
 
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
@@ -82,93 +102,110 @@ final class TransitionOverlayView extends View {
         float cx = w * 0.5f;
         hingeToRight = new LinearGradient(cx, 0, Math.max(cx + 1f, w), 0,
                 new int[]{Color.BLACK, Color.BLACK, Color.TRANSPARENT},
-                new float[]{0f, .18f, 1f}, Shader.TileMode.CLAMP);
+                new float[]{0f, .14f, 1f}, Shader.TileMode.CLAMP);
         hingeToLeft = new LinearGradient(cx, 0, 0, 0,
                 new int[]{Color.BLACK, Color.BLACK, Color.TRANSPARENT},
-                new float[]{0f, .18f, 1f}, Shader.TileMode.CLAMP);
+                new float[]{0f, .14f, 1f}, Shader.TileMode.CLAMP);
+        glassToLeft = new LinearGradient(cx, 0, 0, 0,
+                new int[]{0x66FFFFFF, 0x14FFFFFF, 0x00FFFFFF},
+                new float[]{0f, .20f, 1f}, Shader.TileMode.CLAMP);
     }
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         if (source == null || source.isRecycled() || getWidth() <= 0 || getHeight() <= 0) return;
-        applyViewBlur(currentBlurRadius());
         if (direction == Direction.CLOSING) drawClosing(canvas); else drawOpening(canvas);
-        if (handedOff && timeBlend() < 0.999f) postInvalidateOnAnimation();
+        if (handedOff && target != null && !target.isRecycled() && targetBlend() < 0.999f) {
+            postInvalidateOnAnimation();
+        }
     }
 
     private void drawClosing(Canvas c) {
-        float p = MotionMath.saturate((180f - angle) / 180f);
-        float physical = MotionMath.smootherstep(p);
-        if (!handedOff) {
-            drawClosingOnInner(c, physical);
-        } else {
-            drawClosingOnCover(c, physical, timeBlend());
-        }
+        float p = MotionMath.smootherstep(MotionMath.saturate((180f - visualAngle()) / 180f));
+        if (!handedOff) drawClosingOnInner(c, p); else drawClosingOnCover(c, p, targetBlend());
     }
 
     private void drawOpening(Canvas c) {
-        float p = MotionMath.saturate(angle / 180f);
-        float physical = MotionMath.smootherstep(p);
-        if (!handedOff) {
-            drawOpeningOnCover(c, physical);
-        } else {
-            drawOpeningOnInner(c, physical, timeBlend());
-        }
+        float p = MotionMath.smootherstep(MotionMath.saturate(visualAngle() / 180f));
+        if (!handedOff) drawOpeningOnCover(c, p); else drawOpeningOnInner(c, p, targetBlend());
+    }
+
+    private Rect closingHeroSource(float progress) {
+        int leftWidth = Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
+        float coverAspect = MotionMath.clamp(Prefs.coverAspect(getContext()), .30f, .72f);
+        int coverWidthInSource = Math.max(1, Math.min(leftWidth, Math.round(source.getHeight() * coverAspect)));
+        float morph = MotionMath.smootherstep(MotionMath.remap(progress, .06f, .72f));
+        int width = Math.max(1, Math.round(MotionMath.lerp(leftWidth, coverWidthInSource, morph)));
+        // Anchor to the physical left edge. The hinge-side content is progressively cropped away.
+        return new Rect(0, 0, width, source.getHeight());
     }
 
     private void drawClosingOnInner(Canvas c, float p) {
         int w = getWidth(), h = getHeight();
         float split = w * Prefs.leftPanel(getContext());
-        float midBlur = Prefs.blur(getContext()) * (float) Math.pow(MotionMath.bell(p), .68);
+        float speed = speedBoost();
+        c.drawColor(Color.BLACK);
 
-        Rect leftSrc = new Rect(0, 0, Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext()))), source.getHeight());
-        RectF leftDst = new RectF(0, 0, split, h);
-        float leftScaleX = 1f - Prefs.perspective(getContext()) * MotionMath.easeInCubic(p);
+        // HERO SURFACE: the left half is deliberately stable and gradually reframed to cover-screen aspect.
+        Rect heroSrc = closingHeroSource(p);
+        RectF heroDst = new RectF(0, 0, split, h);
+        float heroBlur = Prefs.blur(getContext()) * (.10f + .24f * speed) * (float) Math.pow(MotionMath.bell(p), .78f);
+        float heroScaleX = 1f - Prefs.compression(getContext()) * .30f * MotionMath.bell(p);
+        float heroScaleY = 1f - .008f * MotionMath.bell(p);
         int save = c.save();
-        c.scale(leftScaleX, 1f - 0.010f * MotionMath.bell(p), split, h * .5f);
-        drawBitmap(c, source, leftSrc, leftDst, midBlur * .72f, 1f);
+        c.scale(heroScaleX, heroScaleY, split, h * .5f);
+        drawBitmap(c, source, heroSrc, heroDst, heroBlur, 1f);
         c.restoreToCount(save);
 
-        Rect rightSrc = new Rect(leftSrc.right, 0, source.getWidth(), source.getHeight());
+        // FOLDING SURFACE: the right half physically rotates into the hinge instead of merely shrinking.
+        int rightStart = Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
+        Rect rightSrc = new Rect(rightStart, 0, source.getWidth(), source.getHeight());
         RectF rightDst = new RectF(split, 0, w, h);
-        float rightScaleX = 1f - 0.11f * MotionMath.easeInCubic(p);
-        save = c.save();
-        c.scale(rightScaleX, 1f, split, h * .5f);
-        drawBitmap(c, source, rightSrc, rightDst, midBlur * 1.18f + 2f * p, 1f);
-        c.restoreToCount(save);
+        float pageFold = MotionMath.easeOutCubic(MotionMath.remap(p, .015f, .72f));
+        float rotateY = -87f * pageFold;
+        float rightBlur = Prefs.blur(getContext()) * (0.14f + .94f * MotionMath.smoothstep(MotionMath.remap(p, .04f, .62f)))
+                + 6f * speed;
+        float rightAlpha = 1f - .36f * MotionMath.smoothstep(MotionMath.remap(p, .58f, .88f));
+        drawPerspectivePane(c, source, rightSrc, rightDst, rotateY, split, rightBlur, rightAlpha);
 
-        float rightBlack = Prefs.black(getContext()) * MotionMath.smoothstep(MotionMath.remap(p, .06f, .78f));
+        float rightBlack = Prefs.black(getContext()) * MotionMath.smootherstep(MotionMath.remap(p, .045f, .70f));
         dimPaint.setColor(Color.BLACK);
-        dimPaint.setAlpha(Math.round(255f * rightBlack));
+        dimPaint.setAlpha(Math.round(255f * MotionMath.clamp(rightBlack, 0f, .985f)));
         c.drawRect(split, 0, w, h, dimPaint);
 
-        float leftBlack = .32f * MotionMath.bell(p) + .18f * MotionMath.easeInCubic(MotionMath.remap(p, .55f, 1f));
-        dimPaint.setAlpha(Math.round(255f * leftBlack));
+        // Apple-like behavior: the surviving pane stays readable much longer, then gently falls into black near handoff.
+        float heroBlack = .08f * MotionMath.bell(p)
+                + .24f * MotionMath.smootherstep(MotionMath.remap(p, .73f, 1f));
+        dimPaint.setAlpha(Math.round(255f * heroBlack));
         c.drawRect(0, 0, split, h, dimPaint);
-        drawHingeShadow(c, split, p, true);
+
+        drawHingeShadow(c, split, MotionMath.clamp(.12f + p * 1.08f, 0f, 1f), true);
+        drawGlassSheen(c, split, p);
     }
 
-    private void drawClosingOnCover(Canvas c, float p, float t) {
+    private void drawClosingOnCover(Canvas c, float p, float blend) {
         int w = getWidth(), h = getHeight();
         c.drawColor(Color.BLACK);
 
-        Rect leftSrc = new Rect(0, 0, Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext()))), source.getHeight());
-        RectF full = coverRect(leftSrc.width(), leftSrc.height(), w, h);
-        float sourceBlur = MotionMath.lerp(Prefs.blur(getContext()) * .72f, 0f, t);
-        float sourceAlpha = 1f - MotionMath.smoothstep(MotionMath.remap(t, .34f, 1f));
-        float squash = MotionMath.lerp(.965f, 1f, t);
+        Rect heroSrc = closingHeroSource(1f);
+        RectF full = coverRect(heroSrc.width(), heroSrc.height(), w, h);
+        float settle = target == null ? 0f : blend;
+        float sourceBlur = MotionMath.lerp(Prefs.blur(getContext()) * .20f, 0f, settle);
+        float sourceAlpha = 1f - MotionMath.smootherstep(MotionMath.remap(settle, .28f, 1f));
+        float squashX = MotionMath.lerp(.976f, 1f, settle);
+        float squashY = MotionMath.lerp(.988f, 1f, settle);
         int save = c.save();
-        c.scale(squash, MotionMath.lerp(.985f, 1f, t), w * .5f, h * .5f);
-        drawBitmap(c, source, leftSrc, full, sourceBlur, sourceAlpha);
+        c.scale(squashX, squashY, w * .5f, h * .5f);
+        drawBitmap(c, source, heroSrc, full, sourceBlur, sourceAlpha);
         c.restoreToCount(save);
 
         if (target != null && !target.isRecycled()) {
-            float targetAlpha = MotionMath.smootherstep(MotionMath.remap(t, .08f, .96f));
-            float targetBlur = Prefs.blur(getContext()) * .82f * (1f - targetAlpha);
+            float targetAlpha = MotionMath.smootherstep(MotionMath.remap(settle, .03f, .92f));
+            float targetBlur = Prefs.blur(getContext()) * .44f * (1f - targetAlpha);
             drawBitmapCover(c, target, targetBlur, targetAlpha);
         }
 
-        float veil = .46f * (1f - t);
+        float veil = MotionMath.lerp(.18f, 0f, settle);
         dimPaint.setColor(Color.BLACK);
         dimPaint.setAlpha(Math.round(255f * veil));
         c.drawRect(0, 0, w, h, dimPaint);
@@ -176,60 +213,102 @@ final class TransitionOverlayView extends View {
 
     private void drawOpeningOnCover(Canvas c, float p) {
         int w = getWidth(), h = getHeight();
-        float blur = Prefs.blur(getContext()) * MotionMath.easeOutCubic(MotionMath.remap(p, .05f, .52f));
-        float scale = 1f - .035f * MotionMath.easeInCubic(p);
+        float speed = speedBoost();
+        c.drawColor(Color.BLACK);
+
+        float blur = Prefs.blur(getContext()) * (.12f + .78f * MotionMath.smoothstep(MotionMath.remap(p, .03f, .58f)))
+                + 4f * speed;
+        float scaleX = 1f - Prefs.compression(getContext()) * .48f * MotionMath.easeInCubic(p);
+        float scaleY = 1f - .009f * MotionMath.easeInCubic(p);
         int save = c.save();
-        c.scale(scale, 1f - .012f * p, w * .5f, h * .5f);
+        c.scale(scaleX, scaleY, w * .5f, h * .5f);
         drawBitmapCover(c, source, blur, 1f);
         c.restoreToCount(save);
 
-        float black = .62f * MotionMath.easeInCubic(MotionMath.remap(p, .04f, .60f));
+        float black = .58f * MotionMath.smootherstep(MotionMath.remap(p, .025f, .60f));
         dimPaint.setColor(Color.BLACK);
         dimPaint.setAlpha(Math.round(255f * black));
         c.drawRect(0, 0, w, h, dimPaint);
     }
 
-    private void drawOpeningOnInner(Canvas c, float p, float t) {
+    private void drawOpeningOnInner(Canvas c, float p, float blend) {
         int w = getWidth(), h = getHeight();
         float split = w * Prefs.leftPanel(getContext());
         c.drawColor(Color.BLACK);
 
-        if (target != null && !target.isRecycled()) {
-            float angleResolve = MotionMath.smoothstep(MotionMath.remap(p, .14f, .92f));
-            float resolve = Math.max(t, angleResolve);
-            float targetBlur = Prefs.blur(getContext()) * .88f * (1f - resolve);
-            float targetAlpha = MotionMath.smootherstep(MotionMath.remap(resolve, .02f, .98f));
-            drawBitmapCover(c, target, targetBlur, targetAlpha);
+        // Until the destination screenshot arrives, the cover frame remains locked to the left pane.
+        Rect sourceFull = new Rect(0, 0, source.getWidth(), source.getHeight());
+        RectF leftDst = new RectF(0, 0, split, h);
+        float settle = target == null ? 0f : blend;
+        float sourceAlpha = 1f - MotionMath.smootherstep(MotionMath.remap(settle, .20f, .92f));
+        float sourceBlur = Prefs.blur(getContext()) * .30f * MotionMath.bell(settle);
+        drawBitmap(c, source, sourceFull, leftDst, sourceBlur, sourceAlpha);
 
-            float rightVeil = Prefs.black(getContext()) * (1f - MotionMath.smoothstep(MotionMath.remap(resolve, .16f, .88f)));
+        if (target != null && !target.isRecycled()) {
+            int targetSplitPx = Math.max(1, Math.round(target.getWidth() * Prefs.leftPanel(getContext())));
+            Rect targetLeft = new Rect(0, 0, targetSplitPx, target.getHeight());
+            RectF targetLeftDst = new RectF(0, 0, split, h);
+            float leftAlpha = MotionMath.smootherstep(MotionMath.remap(settle, .02f, .76f));
+            float leftBlur = Prefs.blur(getContext()) * .30f * (1f - leftAlpha);
+            drawBitmap(c, target, targetLeft, targetLeftDst, leftBlur, leftAlpha);
+
+            Rect targetRight = new Rect(targetSplitPx, 0, target.getWidth(), target.getHeight());
+            RectF targetRightDst = new RectF(split, 0, w, h);
+            float pageOpen = MotionMath.smootherstep(MotionMath.remap(Math.max(settle, p), .08f, .95f));
+            float rotateY = -87f * (1f - pageOpen);
+            float rightAlpha = MotionMath.smootherstep(MotionMath.remap(settle, .10f, .94f));
+            float rightBlur = Prefs.blur(getContext()) * .72f * (1f - pageOpen);
+            drawPerspectivePane(c, target, targetRight, targetRightDst, rotateY, split, rightBlur, rightAlpha);
+
+            float rightVeil = Prefs.black(getContext()) * (1f - MotionMath.smootherstep(MotionMath.remap(pageOpen, .12f, .90f)));
             dimPaint.setColor(Color.BLACK);
             dimPaint.setAlpha(Math.round(255f * rightVeil));
             c.drawRect(split, 0, w, h, dimPaint);
         }
 
-        Rect fullSrc = new Rect(0, 0, source.getWidth(), source.getHeight());
-        RectF leftDst = new RectF(0, 0, split, h);
-        float sourceFade = 1f - MotionMath.smootherstep(MotionMath.remap(Math.max(t, p), .20f, .88f));
-        float sourceBlur = Prefs.blur(getContext()) * .70f * MotionMath.bell(MotionMath.remap(Math.max(t, p), .02f, .96f));
-        drawBitmap(c, source, fullSrc, leftDst, sourceBlur, sourceFade);
+        drawHingeShadow(c, split, 1f - MotionMath.smootherstep(MotionMath.remap(Math.max(settle, p), .08f, .96f)), false);
+    }
 
-        drawHingeShadow(c, split, 1f - Math.max(t, p), false);
+    private void drawPerspectivePane(Canvas c, Bitmap b, Rect src, RectF dst, float rotationY,
+                                     float pivotX, float blurRadius, float alpha) {
+        int save = c.save();
+        c.clipRect(dst.left, dst.top, dst.right, dst.bottom);
+        cameraMatrix.reset();
+        camera.save();
+        camera.rotateY(rotationY);
+        camera.getMatrix(cameraMatrix);
+        camera.restore();
+        cameraMatrix.preTranslate(-pivotX, -dst.centerY());
+        cameraMatrix.postTranslate(pivotX, dst.centerY());
+        c.concat(cameraMatrix);
+        drawBitmap(c, b, src, dst, blurRadius, alpha);
+        c.restoreToCount(save);
     }
 
     private void drawHingeShadow(Canvas c, float split, float strength, boolean rightHeavy) {
         if (strength <= .001f) return;
         float w = getWidth(), h = getHeight();
-        float band = Math.max(18f, w * .13f);
+        float band = Math.max(22f, w * .16f);
         seamPaint.setShader(rightHeavy ? hingeToRight : hingeToLeft);
-        seamPaint.setAlpha(Math.round(255f * MotionMath.clamp(.18f + .76f * strength, 0f, .94f)));
-        if (rightHeavy) c.drawRect(split, 0, Math.min(w, split + band * 2.2f), h, seamPaint);
-        else c.drawRect(Math.max(0, split - band * 2.2f), 0, split, h, seamPaint);
+        seamPaint.setAlpha(Math.round(255f * MotionMath.clamp(.12f + .78f * strength, 0f, .92f)));
+        if (rightHeavy) c.drawRect(split, 0, Math.min(w, split + band * 2.0f), h, seamPaint);
+        else c.drawRect(Math.max(0, split - band * 2.0f), 0, split, h, seamPaint);
         seamPaint.setShader(null);
 
-        edgePaint.setColor(Color.BLACK);
-        edgePaint.setAlpha(Math.round(255f * .38f * strength));
-        float seam = Math.max(2f, w * .006f) * (0.35f + strength);
-        c.drawRect(split - seam, 0, split + seam, h, edgePaint);
+        seamPaint.setColor(Color.BLACK);
+        seamPaint.setAlpha(Math.round(255f * .52f * strength));
+        float seam = Math.max(1.5f, w * .0045f) * (0.45f + strength);
+        c.drawRect(split - seam, 0, split + seam, h, seamPaint);
+    }
+
+    private void drawGlassSheen(Canvas c, float split, float progress) {
+        float bell = MotionMath.bell(MotionMath.remap(progress, .05f, .88f));
+        if (bell <= .005f || glassToLeft == null) return;
+        float band = getWidth() * .16f;
+        sheenPaint.setShader(glassToLeft);
+        sheenPaint.setAlpha(Math.round(255f * Prefs.haze(getContext()) * .74f * bell));
+        c.drawRect(Math.max(0f, split - band), 0, split, getHeight(), sheenPaint);
+        sheenPaint.setShader(null);
     }
 
     private void drawBitmapCover(Canvas c, Bitmap b, float blur, float alpha) {
@@ -244,53 +323,33 @@ final class TransitionOverlayView extends View {
         if (ba > va) {
             float dw = vh * ba;
             return new RectF((vw - dw) * .5f, 0, (vw + dw) * .5f, vh);
-        } else {
-            float dh = vw / Math.max(.0001f, ba);
-            return new RectF(0, (vh - dh) * .5f, vw, (vh + dh) * .5f);
         }
+        float dh = vw / Math.max(.0001f, ba);
+        return new RectF(0, (vh - dh) * .5f, vw, (vh + dh) * .5f);
     }
 
-    private float currentBlurRadius() {
-        float physical = direction == Direction.CLOSING
-                ? MotionMath.smootherstep(MotionMath.saturate((180f - angle) / 180f))
-                : MotionMath.smootherstep(MotionMath.saturate(angle / 180f));
-        if (!handedOff) {
-            return Prefs.blur(getContext()) * (float) Math.pow(MotionMath.bell(physical), .68);
-        }
-        float t = timeBlend();
-        if (direction == Direction.CLOSING) {
-            return Prefs.blur(getContext()) * .72f * (1f - t);
-        }
-        float angleResolve = MotionMath.smoothstep(MotionMath.remap(physical, .14f, .92f));
-        return Prefs.blur(getContext()) * .82f * (1f - Math.max(t, angleResolve));
-    }
-
-    private void applyViewBlur(float radius) {
-        if (Build.VERSION.SDK_INT < 31) return;
-        int r = Math.round(MotionMath.clamp(radius, 0f, 64f));
-        if (r == appliedBlurRadius) return;
-        appliedBlurRadius = r;
-        if (r <= 0) {
-            setRenderEffect(null);
-            return;
-        }
+    private RenderEffect blurEffect(float radius) {
+        if (Build.VERSION.SDK_INT < 31) return null;
+        int r = Math.round(MotionMath.clamp(radius, 0f, 56f) / 2f) * 2;
+        if (r <= 0) return null;
         RenderEffect effect = blurCache.get(r);
         if (effect == null) {
             effect = RenderEffect.createBlurEffect(r, r, Shader.TileMode.CLAMP);
             blurCache.put(r, effect);
         }
-        setRenderEffect(effect);
+        return effect;
     }
 
     private void drawBitmap(Canvas c, Bitmap b, Rect src, RectF dst, float blurRadius, float alpha) {
         imagePaint.setAlpha(Math.round(255f * MotionMath.saturate(alpha)));
+        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(blurEffect(blurRadius));
         c.drawBitmap(b, src, dst, imagePaint);
+        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
         imagePaint.setAlpha(255);
     }
 
     @Override protected void onDetachedFromWindow() {
-        if (Build.VERSION.SDK_INT >= 31) setRenderEffect(null);
-        appliedBlurRadius = -1;
+        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
         super.onDetachedFromWindow();
     }
 }
