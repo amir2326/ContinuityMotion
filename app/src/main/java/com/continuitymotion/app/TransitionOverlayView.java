@@ -6,6 +6,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.os.SystemClock;
@@ -16,7 +17,7 @@ final class TransitionOverlayView extends View {
     private final Paint imagePaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG | Paint.DITHER_FLAG);
     private final Paint blackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint panelShadePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final RectF rect = new RectF();
+    private final Rect srcRect = new Rect();
 
     private Bitmap screenshot;
     private Bitmap mediumBlur;
@@ -45,8 +46,6 @@ final class TransitionOverlayView extends View {
         releaseBlurLayers();
         screenshot = bitmap;
         sourceAspect = bitmap.getWidth() / (float) bitmap.getHeight();
-        // Galaxy cover displays are very tall/narrow; the opened inner display
-        // is much closer to square in portrait orientation.
         sourceIsInner = sourceAspect > 0.62f;
         mediumBlur = makeScaledLayer(bitmap, 520);
         heavyBlur = makeScaledLayer(bitmap, 160);
@@ -144,9 +143,6 @@ final class TransitionOverlayView extends View {
         float black = MotionMath.endpointBlack(a);
         float switchedAge = switchAgeFactor(235f);
 
-        // If DEFAULT_DISPLAY has resized to the narrow cover geometry, finish
-        // the illusion by showing the surviving right panel full-screen for a
-        // fraction of a second and dissolve it into the live cover display.
         if (!nowInner) {
             float fade = Math.max(switchedAge, finalReveal);
             drawRegionCrossBlur(c, 0.50f, 1f, new RectF(0f, 0f, getWidth(), getHeight()),
@@ -161,17 +157,11 @@ final class TransitionOverlayView extends View {
         float h = getHeight();
         float cx = w * 0.5f;
 
-        // RIGHT HALF = continuity anchor. It progressively expands toward the
-        // left so that by the physical handoff it already resembles the cover
-        // display's single-column viewport.
         float survivor = MotionMath.smootherstep(MotionMath.remap(morph, 0.10f, 0.98f));
         float rightLeft = MotionMath.lerp(cx, 0f, survivor * 0.92f);
         RectF rightDst = new RectF(rightLeft, 0f, w, h);
         drawRegionCrossBlur(c, 0.50f, 1f, rightDst, blur * 0.38f, 255f);
 
-        // LEFT HALF = folding panel. Shrink it into the hinge, soften it,
-        // reduce opacity, then wash it into black. This is the visual element
-        // the user specifically asked to see morph away.
         float leftInset = cx * 0.42f * survivor;
         RectF leftDst = new RectF(leftInset, 0f, cx, h);
         float leftAlpha = 255f * (1f - 0.84f * MotionMath.smootherstep(morph));
@@ -180,15 +170,11 @@ final class TransitionOverlayView extends View {
         panelShadePaint.setAlpha(Math.round(255f * 0.82f * MotionMath.smootherstep(morph)));
         c.drawRect(leftDst, panelShadePaint);
 
-        // Soft hinge shadow prevents the two digital layers from looking like
-        // two flat rectangles sliding across one another.
         blackPaint.setColor(Color.BLACK);
         blackPaint.setAlpha(Math.round(255f * 0.28f * morph));
         float shadow = Math.max(3f, w * 0.018f);
         c.drawRect(cx - shadow, 0f, cx + shadow * 0.15f, h, blackPaint);
 
-        // Only the last part goes fully black. That masks Samsung's compositor
-        // swap rather than making the entire gesture feel like a fade-to-black.
         if (black > 0f) {
             blackPaint.setAlpha(Math.round(255f * 0.96f * black * (1f - finalReveal)));
             c.drawRect(0f, 0f, w, h, blackPaint);
@@ -201,8 +187,6 @@ final class TransitionOverlayView extends View {
         float blur = MotionMath.clamp(optical * (Prefs.blur(getContext()) / 30f), 0f, 1f);
 
         if (!nowInner) {
-            // Still on the cover: the current app remains perfectly aligned,
-            // but starts to soften and sink toward black as the hinge opens.
             drawRegionCrossBlur(c, 0f, 1f, new RectF(0f, 0f, getWidth(), getHeight()), blur, 255f);
             blackPaint.setColor(Color.BLACK);
             blackPaint.setAlpha(Math.round(255f * 0.88f * optical));
@@ -210,9 +194,6 @@ final class TransitionOverlayView extends View {
             return;
         }
 
-        // We are now on the inner display. The old cover frame occupies the
-        // RIGHT half while the new live inner display is already underneath.
-        // The left side begins black and both overlays melt away together.
         float ageReveal = switchAgeFactor(285f);
         float angleReveal = MotionMath.smootherstep(MotionMath.remap(a, 25f, 104f));
         float reveal = Math.max(Math.max(ageReveal, angleReveal), finalReveal);
@@ -227,8 +208,6 @@ final class TransitionOverlayView extends View {
         panelShadePaint.setAlpha(Math.round(255f * 0.94f * remain));
         c.drawRect(0f, 0f, cx, h, panelShadePaint);
 
-        // Brief global black bridge exactly at the display resize. This is the
-        // tiny optical blackout that makes the physical handoff feel continuous.
         float bridge = 1f - MotionMath.smootherstep(MotionMath.remap(ageReveal, 0f, 0.34f));
         blackPaint.setColor(Color.BLACK);
         blackPaint.setAlpha(Math.round(255f * 0.52f * bridge * remain));
@@ -253,9 +232,12 @@ final class TransitionOverlayView extends View {
 
     private void drawRegion(Canvas c, Bitmap b, float leftFrac, float rightFrac, RectF dst, float alpha) {
         if (b == null || b.isRecycled() || alpha <= 0.5f) return;
-        rect.set(b.getWidth() * leftFrac, 0f, b.getWidth() * rightFrac, b.getHeight());
+        int left = Math.round(b.getWidth() * leftFrac);
+        int right = Math.round(b.getWidth() * rightFrac);
+        if (right <= left) return;
+        srcRect.set(left, 0, right, b.getHeight());
         imagePaint.setAlpha(Math.round(MotionMath.clamp(alpha, 0f, 255f)));
-        c.drawBitmap(b, rect, dst, imagePaint);
+        c.drawBitmap(b, srcRect, dst, imagePaint);
     }
 
     private float switchAgeFactor(float durationMs) {
