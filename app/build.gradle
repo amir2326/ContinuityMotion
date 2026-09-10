@@ -10,8 +10,8 @@ android {
         applicationId 'com.continuitymotion.app'
         minSdk 30
         targetSdk 36
-        versionCode 10
-        versionName '1.0.0-duomirror'
+        versionCode 11
+        versionName '1.1.0-duomirror-v2'
     }
 
     buildTypes {
