@@ -251,7 +251,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         float sourceAspect = sourceWidth / (float) Math.max(1, sourceHeight);
         float candidateAspect = width / (float) Math.max(1, height);
         float aspectDelta = Math.abs((float) Math.log(Math.max(.01f, candidateAspect / sourceAspect)));
-        float areaRatio = (width * (double) height) / Math.max(1d, sourceWidth * (double) sourceHeight);
+        double areaRatio = (width * (double) height) / Math.max(1d, sourceWidth * (double) sourceHeight);
         return aspectDelta > 0.14f || areaRatio < 0.72 || areaRatio > 1.39;
     }
 
