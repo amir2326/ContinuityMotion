@@ -12,7 +12,9 @@ final class FoldSensor implements SensorEventListener {
     private final SensorManager manager;
     private final Sensor hinge;
     private final Listener listener;
-    private float lastAngle = Float.NaN;
+    private float filteredAngle = Float.NaN;
+    private float filteredVelocity = 0f;
+    private float lastFilteredAngle = Float.NaN;
     private long lastNanos = 0L;
 
     FoldSensor(Context context, Listener listener) {
@@ -24,26 +26,49 @@ final class FoldSensor implements SensorEventListener {
     boolean isAvailable() { return hinge != null; }
 
     void start() {
-        if (hinge != null) manager.registerListener(this, hinge, SensorManager.SENSOR_DELAY_GAME);
+        if (hinge != null) {
+            // Samsung foldables can expose updates faster than SENSOR_DELAY_GAME.
+            // We sample as fast as the OEM allows, then filter before rendering.
+            manager.registerListener(this, hinge, SensorManager.SENSOR_DELAY_FASTEST);
+        }
     }
 
     void stop() {
         if (manager != null) manager.unregisterListener(this);
-        lastAngle = Float.NaN;
+        filteredAngle = Float.NaN;
+        lastFilteredAngle = Float.NaN;
+        filteredVelocity = 0f;
         lastNanos = 0L;
     }
 
     @Override public void onSensorChanged(SensorEvent event) {
         if (event.values.length == 0) return;
-        float angle = MotionMath.clamp(event.values[0], 0f, 180f);
-        float velocity = 0f;
-        if (!Float.isNaN(lastAngle) && lastNanos != 0L && event.timestamp > lastNanos) {
-            float dt = (event.timestamp - lastNanos) / 1_000_000_000f;
-            if (dt > 0.0001f) velocity = (angle - lastAngle) / dt;
+        float rawAngle = MotionMath.clamp(event.values[0], 0f, 180f);
+
+        if (Float.isNaN(filteredAngle) || lastNanos == 0L || event.timestamp <= lastNanos) {
+            filteredAngle = rawAngle;
+            lastFilteredAngle = rawAngle;
+            filteredVelocity = 0f;
+            lastNanos = event.timestamp;
+            listener.onHingeAngle(filteredAngle, filteredVelocity);
+            return;
         }
-        lastAngle = angle;
+
+        float dt = (event.timestamp - lastNanos) / 1_000_000_000f;
+        dt = MotionMath.clamp(dt, 0.001f, 0.05f);
+
+        // Very short time constant: remove sensor stair-stepping without making
+        // the visual effect visibly lag behind the physical hinge.
+        float angleAlpha = 1f - (float) Math.exp(-dt / 0.010f);
+        filteredAngle += (rawAngle - filteredAngle) * angleAlpha;
+
+        float rawVelocity = (filteredAngle - lastFilteredAngle) / dt;
+        float velocityAlpha = 1f - (float) Math.exp(-dt / 0.028f);
+        filteredVelocity += (rawVelocity - filteredVelocity) * velocityAlpha;
+
+        lastFilteredAngle = filteredAngle;
         lastNanos = event.timestamp;
-        listener.onHingeAngle(angle, velocity);
+        listener.onHingeAngle(filteredAngle, filteredVelocity);
     }
 
     @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
