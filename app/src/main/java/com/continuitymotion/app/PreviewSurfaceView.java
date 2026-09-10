@@ -24,9 +24,11 @@ final class PreviewSurfaceView extends View {
     void setAngle(float value) {
         angle = value;
         if (Build.VERSION.SDK_INT >= 31) {
-            float bell = MotionMath.bell(MotionMath.normalizeAngle(angle));
-            float radius = Prefs.blur(getContext()) * bell * density;
-            setRenderEffect(radius > 0.5f ? RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP) : null);
+            float blur = MotionMath.handoffBlur(angle);
+            float radius = Prefs.blur(getContext()) * blur * density;
+            setRenderEffect(radius > 0.5f
+                    ? RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP)
+                    : null);
         }
         invalidate();
     }
@@ -34,11 +36,11 @@ final class PreviewSurfaceView extends View {
     @Override protected void onDraw(Canvas c) {
         int w = getWidth(), h = getHeight();
         c.drawColor(Color.rgb(15, 16, 21));
-        float progress = MotionMath.smoothstep(MotionMath.normalizeAngle(angle));
-        float bell = MotionMath.bell(progress);
-        float scale = 1f - Prefs.compression(getContext()) * bell;
+
+        float envelope = MotionMath.handoffOpacity(angle);
+        float zoom = 1f + Prefs.compression(getContext()) * envelope;
         c.save();
-        c.scale(scale, scale, w / 2f, h / 2f);
+        c.scale(zoom, zoom, w / 2f, h / 2f);
 
         // Neutral mock home screen: no Apple artwork/assets are bundled.
         p.setColor(Color.rgb(33, 35, 45));
@@ -62,7 +64,10 @@ final class PreviewSurfaceView extends View {
         c.drawRoundRect(new RectF(42*density,h-112*density,w-42*density,h-44*density), 30*density,30*density,p);
         c.restore();
 
-        p.setColor(Color.argb((int)(255*Prefs.haze(getContext())*bell),235,235,242));
-        c.drawRect(0,0,w,h,p);
+        int veil = Math.round(255f * Prefs.haze(getContext()) * envelope);
+        if (veil > 0) {
+            p.setColor(Color.argb(veil,20,22,28));
+            c.drawRect(0,0,w,h,p);
+        }
     }
 }
