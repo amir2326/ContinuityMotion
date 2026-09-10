@@ -2,7 +2,8 @@
     android:description="@string/service_desc"
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowsChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
-    android:notificationTimeout="100"
+    android:notificationTimeout="30"
     android:canTakeScreenshot="true"
-    android:canRetrieveWindowContent="false"
+    android:canRetrieveWindowContent="true"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
     android:settingsActivity="com.continuitymotion.app.MainActivity" />
