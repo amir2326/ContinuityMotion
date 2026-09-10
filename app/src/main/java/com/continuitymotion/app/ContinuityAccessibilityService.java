@@ -21,6 +21,9 @@ import android.view.accessibility.AccessibilityWindowInfo;
 import java.util.List;
 
 public final class ContinuityAccessibilityService extends AccessibilityService implements FoldSensor.Listener {
+    private static final long MIN_SCREENSHOT_GAP_MS = 390L;
+    private static final long PRIME_MAX_AGE_MS = 6500L;
+
     private FoldSensor foldSensor;
     private WindowManager windowManager;
     private WindowManager.LayoutParams overlayParams;
@@ -28,21 +31,32 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
 
     private Bitmap sourceFrame;
     private Bitmap targetFrame;
+    private Bitmap primedFrame;
     private TransitionOverlayView.Direction direction;
     private boolean transitionActive = false;
     private boolean sourceCaptureInFlight = false;
     private boolean targetCaptureInFlight = false;
+    private boolean primeCaptureInFlight = false;
     private boolean handoffDetected = false;
+    private boolean primeScheduled = false;
     private float pendingAngle = 180f;
     private float pendingVelocity = 0f;
-    private long motionStartedAt = 0L;
     private long lastMotionAt = 0L;
     private long generation = 0L;
+    private long uiVersion = 0L;
+    private long primedUiVersion = -1L;
+    private long primedAt = 0L;
+    private long lastScreenshotRequestAt = 0L;
     private int sourceWidth = 0;
     private int sourceHeight = 0;
     private int lastViewWidth = 0;
     private int lastViewHeight = 0;
     private final Handler main = new Handler(Looper.getMainLooper());
+
+    private final Runnable primeRunnable = () -> {
+        primeScheduled = false;
+        primeFrameIfStable();
+    };
 
     @Override protected void onServiceConnected() {
         super.onServiceConnected();
@@ -56,22 +70,42 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
 
         foldSensor = new FoldSensor(this, this);
         foldSensor.start();
-        RuntimeState.transition = "Ready";
-        RuntimeState.capture = "Waiting for fold motion";
+        RuntimeState.transition = "Ready • Duo Mirror v2";
+        RuntimeState.capture = "Waiting for hinge • idle frames are prewarmed";
     }
 
     @Override public void onDestroy() {
         generation++;
+        main.removeCallbacksAndMessages(null);
         if (foldSensor != null) foldSensor.stop();
         finishTransition("Service stopped");
+        main.removeCallbacksAndMessages(null);
+        recycle(primedFrame);
+        primedFrame = null;
         super.onDestroy();
     }
 
-    @Override public void onAccessibilityEvent(AccessibilityEvent event) { }
+    @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null || transitionActive || sourceCaptureInFlight || targetCaptureInFlight) return;
+        CharSequence pkg = event.getPackageName();
+        if (pkg != null && getPackageName().contentEquals(pkg)) return;
+
+        int type = event.getEventType();
+        if (type == AccessibilityEvent.TYPE_VIEW_CLICKED
+                || type == AccessibilityEvent.TYPE_VIEW_SCROLLED
+                || type == AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                || type == AccessibilityEvent.TYPE_WINDOWS_CHANGED) {
+            uiVersion++;
+            schedulePrime(210L);
+        }
+    }
+
     @Override public void onInterrupt() { }
 
     @Override public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        uiVersion++;
         if (transitionActive) {
             if (overlay != null) {
                 overlay.requestLayout();
@@ -79,6 +113,8 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
             } else {
                 checkDisplayHandoff(true);
             }
+        } else {
+            schedulePrime(260L);
         }
     }
 
@@ -90,15 +126,19 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         RuntimeState.hingeEvents++;
 
         long now = SystemClock.uptimeMillis();
-        boolean moving = Math.abs(velocity) >= 2.2f;
+        boolean moving = Math.abs(velocity) >= 1.35f;
         if (moving) lastMotionAt = now;
 
         if (!transitionActive && !sourceCaptureInFlight && moving) {
-            if (velocity < -2.2f && angle < 178.8f && angle > 3f) {
+            if (velocity < -1.35f && angle < 179.35f && angle > 2f) {
                 beginTransition(TransitionOverlayView.Direction.CLOSING);
-            } else if (velocity > 2.2f && angle > 1.2f && angle < 177f) {
+            } else if (velocity > 1.35f && angle > .65f && angle < 178.5f) {
                 beginTransition(TransitionOverlayView.Direction.OPENING);
             }
+        } else if (!transitionActive && !sourceCaptureInFlight && !primeCaptureInFlight
+                && (angle <= 4.5f || angle >= 175.5f)
+                && (primedFrame == null || primedUiVersion != uiVersion)) {
+            schedulePrime(180L);
         }
 
         if (transitionActive) {
@@ -124,23 +164,122 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
             }
 
             boolean endpoint = direction == TransitionOverlayView.Direction.CLOSING ? angle <= 4.5f : angle >= 175.5f;
-            if (endpoint && SystemClock.uptimeMillis() - lastMotionAt > 45L) {
-                scheduleFinish(generation, handoffDetected ? Prefs.handoffMs(this) + 90L : 520L);
+            if (endpoint && now - lastMotionAt > 45L) {
+                scheduleFinish(generation, handoffDetected ? Prefs.handoffMs(this) + 115L : 560L);
             }
         }
     }
 
+    private void schedulePrime(long delay) {
+        if (transitionActive || sourceCaptureInFlight || targetCaptureInFlight || primeCaptureInFlight) return;
+        main.removeCallbacks(primeRunnable);
+        primeScheduled = true;
+        main.postDelayed(primeRunnable, delay);
+    }
+
+    private void primeFrameIfStable() {
+        if (transitionActive || sourceCaptureInFlight || targetCaptureInFlight || primeCaptureInFlight) return;
+        if (RuntimeState.hingeEvents <= 0) return;
+        if (Math.abs(pendingVelocity) > 1.4f || (pendingAngle > 6f && pendingAngle < 174f)) return;
+
+        long now = SystemClock.uptimeMillis();
+        long remainingGap = MIN_SCREENSHOT_GAP_MS - (now - lastScreenshotRequestAt);
+        if (remainingGap > 0L) {
+            schedulePrime(remainingGap + 20L);
+            return;
+        }
+
+        primeCaptureInFlight = true;
+        final long captureVersion = uiVersion;
+        lastScreenshotRequestAt = now;
+        takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
+            @Override public void onSuccess(ScreenshotResult result) {
+                primeCaptureInFlight = false;
+                Bitmap b = bitmapFrom(result);
+                if (b == null) return;
+                recycle(primedFrame);
+                primedFrame = b;
+                primedAt = SystemClock.uptimeMillis();
+                primedUiVersion = captureVersion;
+                if (pendingAngle <= 6f && b.getHeight() > 0) {
+                    Prefs.setCoverAspect(ContinuityAccessibilityService.this,
+                            b.getWidth() / (float) b.getHeight());
+                }
+                RuntimeState.capture = "Prewarmed " + b.getWidth() + "×" + b.getHeight();
+                if (captureVersion != uiVersion) schedulePrime(220L);
+            }
+
+            @Override public void onFailure(int errorCode) {
+                primeCaptureInFlight = false;
+                RuntimeState.capture = "Prewarm deferred • error " + errorCode;
+            }
+        });
+    }
+
+    private Bitmap consumePrimedFrame() {
+        if (primedFrame == null || primedFrame.isRecycled()) return null;
+        long age = SystemClock.uptimeMillis() - primedAt;
+        if (age > PRIME_MAX_AGE_MS || primedUiVersion != uiVersion || !bitmapMatchesCurrentDisplay(primedFrame)) {
+            recycle(primedFrame);
+            primedFrame = null;
+            primedAt = 0L;
+            return null;
+        }
+        Bitmap result = primedFrame;
+        primedFrame = null;
+        primedAt = 0L;
+        primedUiVersion = -1L;
+        return result;
+    }
+
+    private boolean bitmapMatchesCurrentDisplay(Bitmap b) {
+        if (b == null || b.isRecycled() || windowManager == null) return false;
+        if (Build.VERSION.SDK_INT >= 30) {
+            try {
+                Rect bounds = windowManager.getCurrentWindowMetrics().getBounds();
+                float ba = b.getWidth() / (float) Math.max(1, b.getHeight());
+                float da = bounds.width() / (float) Math.max(1, bounds.height());
+                float aspectDelta = Math.abs((float) Math.log(Math.max(.01f, ba / da)));
+                double areaRatio = (b.getWidth() * (double) b.getHeight())
+                        / Math.max(1d, bounds.width() * (double) bounds.height());
+                return aspectDelta < .08f && areaRatio > .82d && areaRatio < 1.22d;
+            } catch (RuntimeException ignored) { }
+        }
+        return true;
+    }
+
     private void beginTransition(TransitionOverlayView.Direction d) {
         direction = d;
-        transitionActive = false;
         handoffDetected = false;
         targetCaptureInFlight = false;
-        sourceCaptureInFlight = true;
-        motionStartedAt = SystemClock.uptimeMillis();
+        main.removeCallbacks(primeRunnable);
+        primeScheduled = false;
         generation++;
         long myGeneration = generation;
-        RuntimeState.transition = d == TransitionOverlayView.Direction.CLOSING ? "Closing • capturing inner frame" : "Opening • capturing cover frame";
+
+        Bitmap primed = consumePrimedFrame();
+        if (primed != null) {
+            recycle(sourceFrame);
+            recycle(targetFrame);
+            sourceFrame = primed;
+            targetFrame = null;
+            sourceWidth = primed.getWidth();
+            sourceHeight = primed.getHeight();
+            transitionActive = true;
+            RuntimeState.capture = "Instant source • prewarmed " + sourceWidth + "×" + sourceHeight;
+            RuntimeState.transition = d == TransitionOverlayView.Direction.CLOSING
+                    ? "Closing • left pane locked" : "Opening • cover pane locked";
+            showOverlay();
+            if (overlay != null) overlay.setHinge(pendingAngle, pendingVelocity);
+            checkDisplayHandoff(false);
+            return;
+        }
+
+        sourceCaptureInFlight = true;
+        RuntimeState.transition = d == TransitionOverlayView.Direction.CLOSING
+                ? "Closing • live source capture" : "Opening • live cover capture";
         RuntimeState.capture = "Source capture requested";
+        lastScreenshotRequestAt = SystemClock.uptimeMillis();
 
         takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(), new TakeScreenshotCallback() {
             @Override public void onSuccess(ScreenshotResult result) {
@@ -161,9 +300,14 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                 sourceWidth = b.getWidth();
                 sourceHeight = b.getHeight();
                 transitionActive = true;
-                RuntimeState.capture = "Source " + sourceWidth + "×" + sourceHeight + " captured";
+                if (d == TransitionOverlayView.Direction.OPENING && sourceHeight > 0) {
+                    Prefs.setCoverAspect(ContinuityAccessibilityService.this,
+                            sourceWidth / (float) sourceHeight);
+                }
+                RuntimeState.capture = "Live source " + sourceWidth + "×" + sourceHeight;
                 RuntimeState.display = sourceWidth + "×" + sourceHeight;
-                RuntimeState.transition = d == TransitionOverlayView.Direction.CLOSING ? "Closing • left pane anchored" : "Opening • cover frame anchored";
+                RuntimeState.transition = d == TransitionOverlayView.Direction.CLOSING
+                        ? "Closing • left pane locked" : "Opening • cover pane locked";
                 showOverlay();
                 if (overlay != null) overlay.setHinge(pendingAngle, pendingVelocity);
                 checkDisplayHandoff(false);
@@ -174,6 +318,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
                 sourceCaptureInFlight = false;
                 RuntimeState.capture = "Source capture failed • error " + errorCode;
                 RuntimeState.transition = "Idle • capture blocked";
+                schedulePrime(MIN_SCREENSHOT_GAP_MS + 30L);
             }
         });
     }
@@ -216,7 +361,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         if (!transitionActive || handoffDetected || sourceWidth <= 0 || sourceHeight <= 0) return;
 
         boolean angleSupportsHandoff = direction == TransitionOverlayView.Direction.CLOSING
-                ? pendingAngle < 62f : pendingAngle > 7f;
+                ? pendingAngle < 64f : pendingAngle > 7f;
         if (!angleSupportsHandoff && !configHint) return;
 
         int[][] candidates = new int[3][2];
@@ -261,14 +406,19 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         long now = SystemClock.uptimeMillis();
         RuntimeState.display = width + "×" + height;
         RuntimeState.transition = direction == TransitionOverlayView.Direction.CLOSING
-                ? "Handoff • resolving on cover" : "Handoff • resolving on inner display";
+                ? "Handoff • resolving on cover" : "Handoff • unfolding inner surface";
+        if (direction == TransitionOverlayView.Direction.CLOSING && height > 0) {
+            Prefs.setCoverAspect(this, width / (float) height);
+        }
         if (overlay != null) {
             overlay.markHandoff(now);
             overlay.requestLayout();
         }
 
         long myGeneration = generation;
-        main.postDelayed(() -> captureDestinationWindow(myGeneration, 0), 34L);
+        long sinceLastShot = now - lastScreenshotRequestAt;
+        long delay = Math.max(24L, MIN_SCREENSHOT_GAP_MS - sinceLastShot + 12L);
+        main.postDelayed(() -> captureDestinationWindow(myGeneration, 0), delay);
     }
 
     private void captureDestinationWindow(long myGeneration, int attempt) {
@@ -278,15 +428,23 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
             return;
         }
 
+        long now = SystemClock.uptimeMillis();
+        long remainingGap = MIN_SCREENSHOT_GAP_MS - (now - lastScreenshotRequestAt);
+        if (remainingGap > 0L) {
+            main.postDelayed(() -> captureDestinationWindow(myGeneration, attempt), remainingGap + 14L);
+            return;
+        }
+
         AccessibilityWindowInfo appWindow = findBestApplicationWindow();
         if (appWindow == null) {
-            if (attempt < 4) main.postDelayed(() -> captureDestinationWindow(myGeneration, attempt + 1), 45L);
+            if (attempt < 6) main.postDelayed(() -> captureDestinationWindow(myGeneration, attempt + 1), 58L);
             else RuntimeState.capture = "Destination app window not exposed";
             return;
         }
 
         int windowId = appWindow.getId();
         targetCaptureInFlight = true;
+        lastScreenshotRequestAt = now;
         takeScreenshotOfWindow(windowId, getMainExecutor(), new TakeScreenshotCallback() {
             @Override public void onSuccess(ScreenshotResult result) {
                 if (myGeneration != generation) {
@@ -311,8 +469,11 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
             @Override public void onFailure(int errorCode) {
                 if (myGeneration != generation) return;
                 targetCaptureInFlight = false;
-                RuntimeState.capture = "Destination capture failed • error " + errorCode;
-                if (attempt < 2) main.postDelayed(() -> captureDestinationWindow(myGeneration, attempt + 1), 60L);
+                RuntimeState.capture = "Destination capture deferred • error " + errorCode;
+                if (attempt < 5) {
+                    main.postDelayed(() -> captureDestinationWindow(myGeneration, attempt + 1),
+                            MIN_SCREENSHOT_GAP_MS + 20L);
+                }
             }
         });
     }
@@ -368,7 +529,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
             boolean endpoint = direction == TransitionOverlayView.Direction.CLOSING
                     ? pendingAngle <= 6f : pendingAngle >= 174f;
             boolean idle = SystemClock.uptimeMillis() - lastMotionAt > 80L;
-            if (endpoint && idle) finishTransition("Ready");
+            if (endpoint && idle) finishTransition("Ready • Duo Mirror v2");
         }, delay);
     }
 
@@ -389,6 +550,7 @@ public final class ContinuityAccessibilityService extends AccessibilityService i
         sourceWidth = sourceHeight = 0;
         lastViewWidth = lastViewHeight = 0;
         RuntimeState.transition = state;
+        if (RuntimeState.hingeEvents > 0) schedulePrime(420L);
     }
 
     private static void recycle(Bitmap b) {
