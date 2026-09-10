@@ -26,34 +26,36 @@ final class MotionMath {
         return a + (b - a) * clamp(t, 0f, 1f);
     }
 
-    // 0 = completely open, 1 = completely folded.
     static float foldAmount(float angle) {
         return clamp(1f - angle / 180f, 0f, 1f);
     }
 
-    // The visible panel morph starts almost immediately after closing begins and
-    // finishes before the final hardware display handoff.
     static float panelMorph(float angle) {
         return smootherstep(remap(180f - angle, 7f, 150f));
     }
 
-    // A soft optical blur/darkening pulse around the physical screen switch.
     static float handoffDark(float angle) {
         float rise = smootherstep(remap(180f - angle, 116f, 154f));
         float end = 1f - smootherstep(remap(180f - angle, 154f, 179f));
         return clamp(rise * end, 0f, 1f);
     }
 
-    // Full black only in the final degrees. This hides Samsung's abrupt
-    // compositor swap without making the whole fold gesture look dim.
     static float endpointBlack(float angle) {
         return 1f - smootherstep(remap(angle, 2.5f, 34f));
     }
 
-    // Opening from the cover: darken just before the logical display expands.
     static float openingHandoff(float angle) {
         float rise = smootherstep(remap(angle, 2f, 24f));
         float fall = 1f - smootherstep(remap(angle, 24f, 70f));
         return clamp(rise * fall, 0f, 1f);
+    }
+
+    // Kept for the calibration preview screen.
+    static float handoffBlur(float angle) {
+        return clamp(Math.max(openingHandoff(angle), handoffDark(angle)), 0f, 1f);
+    }
+
+    static float handoffOpacity(float angle) {
+        return panelMorph(angle);
     }
 }
