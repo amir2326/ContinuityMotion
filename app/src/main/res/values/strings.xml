@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Continuity Motion</string>
+    <string name="service_name">Continuity Motion overlay</string>
+    <string name="service_desc">Uses the fold hinge angle to animate a temporary on-device screenshot during fold and unfold transitions. Screenshots are not stored or transmitted.</string>
+</resources>
