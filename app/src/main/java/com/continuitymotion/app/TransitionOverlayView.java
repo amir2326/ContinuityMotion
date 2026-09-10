@@ -8,9 +8,11 @@ import android.graphics.Color;
 import android.graphics.LinearGradient;
 import android.graphics.Matrix;
 import android.graphics.Paint;
+import android.graphics.RecordingCanvas;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.RenderEffect;
+import android.graphics.RenderNode;
 import android.graphics.Shader;
 import android.os.Build;
 import android.os.SystemClock;
@@ -28,6 +30,7 @@ final class TransitionOverlayView extends View {
     private final Paint sheenPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Camera camera = new Camera();
     private final Matrix cameraMatrix = new Matrix();
+    private final RenderNode blurNode = new RenderNode("ContinuityPaneBlur");
     private final Map<Integer, RenderEffect> blurCache = new HashMap<>();
 
     private Bitmap source;
@@ -83,12 +86,13 @@ final class TransitionOverlayView extends View {
     private float targetBlend() {
         if (!handedOff || target == null || target.isRecycled()) return 0f;
         long start = Math.max(handoffMillis, targetArrivedMillis);
-        float t = (SystemClock.uptimeMillis() - start) / (float) Math.max(120, Prefs.handoffMs(getContext()));
+        float t = (SystemClock.uptimeMillis() - start)
+                / (float) Math.max(120, Prefs.handoffMs(getContext()));
         return MotionMath.smootherstep(t);
     }
 
     private float visualAngle() {
-        // Small forward prediction removes the perceptible sensor/render pipeline lag at fast fold speeds.
+        // Predict a small fraction of a frame ahead. Fast physical motion otherwise appears to trail the hinge.
         float lead = MotionMath.clamp(velocity * 0.018f, -3.4f, 3.4f);
         return MotionMath.clamp(angle + lead, 0f, 180f);
     }
@@ -99,6 +103,7 @@ final class TransitionOverlayView extends View {
 
     @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
+        blurNode.setPosition(0, 0, Math.max(1, w), Math.max(1, h));
         float cx = w * 0.5f;
         hingeToRight = new LinearGradient(cx, 0, Math.max(cx + 1f, w), 0,
                 new int[]{Color.BLACK, Color.BLACK, Color.TRANSPARENT},
@@ -115,28 +120,33 @@ final class TransitionOverlayView extends View {
         super.onDraw(canvas);
         if (source == null || source.isRecycled() || getWidth() <= 0 || getHeight() <= 0) return;
         if (direction == Direction.CLOSING) drawClosing(canvas); else drawOpening(canvas);
-        if (handedOff && target != null && !target.isRecycled() && targetBlend() < 0.999f) {
+        if (handedOff && target != null && !target.isRecycled() && targetBlend() < .999f) {
             postInvalidateOnAnimation();
         }
     }
 
     private void drawClosing(Canvas c) {
         float p = MotionMath.smootherstep(MotionMath.saturate((180f - visualAngle()) / 180f));
-        if (!handedOff) drawClosingOnInner(c, p); else drawClosingOnCover(c, p, targetBlend());
+        if (!handedOff) drawClosingOnInner(c, p);
+        else drawClosingOnCover(c, p, targetBlend());
     }
 
     private void drawOpening(Canvas c) {
         float p = MotionMath.smootherstep(MotionMath.saturate(visualAngle() / 180f));
-        if (!handedOff) drawOpeningOnCover(c, p); else drawOpeningOnInner(c, p, targetBlend());
+        if (!handedOff) drawOpeningOnCover(c, p);
+        else drawOpeningOnInner(c, p, targetBlend());
     }
 
     private Rect closingHeroSource(float progress) {
-        int leftWidth = Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
+        int leftWidth = Math.max(1,
+                Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
         float coverAspect = MotionMath.clamp(Prefs.coverAspect(getContext()), .30f, .72f);
-        int coverWidthInSource = Math.max(1, Math.min(leftWidth, Math.round(source.getHeight() * coverAspect)));
+        int coverWidthInSource = Math.max(1,
+                Math.min(leftWidth, Math.round(source.getHeight() * coverAspect)));
         float morph = MotionMath.smootherstep(MotionMath.remap(progress, .06f, .72f));
-        int width = Math.max(1, Math.round(MotionMath.lerp(leftWidth, coverWidthInSource, morph)));
-        // Anchor to the physical left edge. The hinge-side content is progressively cropped away.
+        int width = Math.max(1,
+                Math.round(MotionMath.lerp(leftWidth, coverWidthInSource, morph)));
+        // Left-edge anchoring is the core continuity illusion: content disappears toward the hinge.
         return new Rect(0, 0, width, source.getHeight());
     }
 
@@ -146,10 +156,11 @@ final class TransitionOverlayView extends View {
         float speed = speedBoost();
         c.drawColor(Color.BLACK);
 
-        // HERO SURFACE: the left half is deliberately stable and gradually reframed to cover-screen aspect.
+        // Surviving left surface: remains visually stable while reframing toward cover-screen aspect.
         Rect heroSrc = closingHeroSource(p);
         RectF heroDst = new RectF(0, 0, split, h);
-        float heroBlur = Prefs.blur(getContext()) * (.10f + .24f * speed) * (float) Math.pow(MotionMath.bell(p), .78f);
+        float heroBlur = Prefs.blur(getContext()) * (.10f + .24f * speed)
+                * (float) Math.pow(MotionMath.bell(p), .78f);
         float heroScaleX = 1f - Prefs.compression(getContext()) * .30f * MotionMath.bell(p);
         float heroScaleY = 1f - .008f * MotionMath.bell(p);
         int save = c.save();
@@ -157,23 +168,27 @@ final class TransitionOverlayView extends View {
         drawBitmap(c, source, heroSrc, heroDst, heroBlur, 1f);
         c.restoreToCount(save);
 
-        // FOLDING SURFACE: the right half physically rotates into the hinge instead of merely shrinking.
-        int rightStart = Math.max(1, Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
+        // Folding right surface: rotates into the hinge rather than simply shrinking/fading.
+        int rightStart = Math.max(1,
+                Math.round(source.getWidth() * Prefs.leftPanel(getContext())));
         Rect rightSrc = new Rect(rightStart, 0, source.getWidth(), source.getHeight());
         RectF rightDst = new RectF(split, 0, w, h);
         float pageFold = MotionMath.easeOutCubic(MotionMath.remap(p, .015f, .72f));
         float rotateY = -87f * pageFold;
-        float rightBlur = Prefs.blur(getContext()) * (0.14f + .94f * MotionMath.smoothstep(MotionMath.remap(p, .04f, .62f)))
+        float rightBlur = Prefs.blur(getContext())
+                * (.14f + .94f * MotionMath.smoothstep(MotionMath.remap(p, .04f, .62f)))
                 + 6f * speed;
-        float rightAlpha = 1f - .36f * MotionMath.smoothstep(MotionMath.remap(p, .58f, .88f));
+        float rightAlpha = 1f - .36f
+                * MotionMath.smoothstep(MotionMath.remap(p, .58f, .88f));
         drawPerspectivePane(c, source, rightSrc, rightDst, rotateY, split, rightBlur, rightAlpha);
 
-        float rightBlack = Prefs.black(getContext()) * MotionMath.smootherstep(MotionMath.remap(p, .045f, .70f));
+        float rightBlack = Prefs.black(getContext())
+                * MotionMath.smootherstep(MotionMath.remap(p, .045f, .70f));
         dimPaint.setColor(Color.BLACK);
         dimPaint.setAlpha(Math.round(255f * MotionMath.clamp(rightBlack, 0f, .985f)));
         c.drawRect(split, 0, w, h, dimPaint);
 
-        // Apple-like behavior: the surviving pane stays readable much longer, then gently falls into black near handoff.
+        // The left pane remains readable much longer and falls into black only near display handoff.
         float heroBlack = .08f * MotionMath.bell(p)
                 + .24f * MotionMath.smootherstep(MotionMath.remap(p, .73f, 1f));
         dimPaint.setAlpha(Math.round(255f * heroBlack));
@@ -216,7 +231,8 @@ final class TransitionOverlayView extends View {
         float speed = speedBoost();
         c.drawColor(Color.BLACK);
 
-        float blur = Prefs.blur(getContext()) * (.12f + .78f * MotionMath.smoothstep(MotionMath.remap(p, .03f, .58f)))
+        float blur = Prefs.blur(getContext())
+                * (.12f + .78f * MotionMath.smoothstep(MotionMath.remap(p, .03f, .58f)))
                 + 4f * speed;
         float scaleX = 1f - Prefs.compression(getContext()) * .48f * MotionMath.easeInCubic(p);
         float scaleY = 1f - .009f * MotionMath.easeInCubic(p);
@@ -236,7 +252,7 @@ final class TransitionOverlayView extends View {
         float split = w * Prefs.leftPanel(getContext());
         c.drawColor(Color.BLACK);
 
-        // Until the destination screenshot arrives, the cover frame remains locked to the left pane.
+        // Before Android exposes the destination frame, keep the cover image locked to the left half.
         Rect sourceFull = new Rect(0, 0, source.getWidth(), source.getHeight());
         RectF leftDst = new RectF(0, 0, split, h);
         float settle = target == null ? 0f : blend;
@@ -245,7 +261,8 @@ final class TransitionOverlayView extends View {
         drawBitmap(c, source, sourceFull, leftDst, sourceBlur, sourceAlpha);
 
         if (target != null && !target.isRecycled()) {
-            int targetSplitPx = Math.max(1, Math.round(target.getWidth() * Prefs.leftPanel(getContext())));
+            int targetSplitPx = Math.max(1,
+                    Math.round(target.getWidth() * Prefs.leftPanel(getContext())));
             Rect targetLeft = new Rect(0, 0, targetSplitPx, target.getHeight());
             RectF targetLeftDst = new RectF(0, 0, split, h);
             float leftAlpha = MotionMath.smootherstep(MotionMath.remap(settle, .02f, .76f));
@@ -254,23 +271,29 @@ final class TransitionOverlayView extends View {
 
             Rect targetRight = new Rect(targetSplitPx, 0, target.getWidth(), target.getHeight());
             RectF targetRightDst = new RectF(split, 0, w, h);
-            float pageOpen = MotionMath.smootherstep(MotionMath.remap(Math.max(settle, p), .08f, .95f));
+            float pageOpen = MotionMath.smootherstep(
+                    MotionMath.remap(Math.max(settle, p), .08f, .95f));
             float rotateY = -87f * (1f - pageOpen);
             float rightAlpha = MotionMath.smootherstep(MotionMath.remap(settle, .10f, .94f));
             float rightBlur = Prefs.blur(getContext()) * .72f * (1f - pageOpen);
-            drawPerspectivePane(c, target, targetRight, targetRightDst, rotateY, split, rightBlur, rightAlpha);
+            drawPerspectivePane(c, target, targetRight, targetRightDst,
+                    rotateY, split, rightBlur, rightAlpha);
 
-            float rightVeil = Prefs.black(getContext()) * (1f - MotionMath.smootherstep(MotionMath.remap(pageOpen, .12f, .90f)));
+            float rightVeil = Prefs.black(getContext())
+                    * (1f - MotionMath.smootherstep(MotionMath.remap(pageOpen, .12f, .90f)));
             dimPaint.setColor(Color.BLACK);
             dimPaint.setAlpha(Math.round(255f * rightVeil));
             c.drawRect(split, 0, w, h, dimPaint);
         }
 
-        drawHingeShadow(c, split, 1f - MotionMath.smootherstep(MotionMath.remap(Math.max(settle, p), .08f, .96f)), false);
+        drawHingeShadow(c, split,
+                1f - MotionMath.smootherstep(MotionMath.remap(Math.max(settle, p), .08f, .96f)),
+                false);
     }
 
-    private void drawPerspectivePane(Canvas c, Bitmap b, Rect src, RectF dst, float rotationY,
-                                     float pivotX, float blurRadius, float alpha) {
+    private void drawPerspectivePane(Canvas c, Bitmap b, Rect src, RectF dst,
+                                     float rotationY, float pivotX,
+                                     float blurRadius, float alpha) {
         int save = c.save();
         c.clipRect(dst.left, dst.top, dst.right, dst.bottom);
         cameraMatrix.reset();
@@ -290,14 +313,18 @@ final class TransitionOverlayView extends View {
         float w = getWidth(), h = getHeight();
         float band = Math.max(22f, w * .16f);
         seamPaint.setShader(rightHeavy ? hingeToRight : hingeToLeft);
-        seamPaint.setAlpha(Math.round(255f * MotionMath.clamp(.12f + .78f * strength, 0f, .92f)));
-        if (rightHeavy) c.drawRect(split, 0, Math.min(w, split + band * 2.0f), h, seamPaint);
-        else c.drawRect(Math.max(0, split - band * 2.0f), 0, split, h, seamPaint);
+        seamPaint.setAlpha(Math.round(255f
+                * MotionMath.clamp(.12f + .78f * strength, 0f, .92f)));
+        if (rightHeavy) {
+            c.drawRect(split, 0, Math.min(w, split + band * 2f), h, seamPaint);
+        } else {
+            c.drawRect(Math.max(0, split - band * 2f), 0, split, h, seamPaint);
+        }
         seamPaint.setShader(null);
 
         seamPaint.setColor(Color.BLACK);
         seamPaint.setAlpha(Math.round(255f * .52f * strength));
-        float seam = Math.max(1.5f, w * .0045f) * (0.45f + strength);
+        float seam = Math.max(1.5f, w * .0045f) * (.45f + strength);
         c.drawRect(split - seam, 0, split + seam, h, seamPaint);
     }
 
@@ -340,16 +367,27 @@ final class TransitionOverlayView extends View {
         return effect;
     }
 
-    private void drawBitmap(Canvas c, Bitmap b, Rect src, RectF dst, float blurRadius, float alpha) {
+    private void drawBitmap(Canvas c, Bitmap b, Rect src, RectF dst,
+                            float blurRadius, float alpha) {
         imagePaint.setAlpha(Math.round(255f * MotionMath.saturate(alpha)));
-        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(blurEffect(blurRadius));
-        c.drawBitmap(b, src, dst, imagePaint);
-        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
+        if (Build.VERSION.SDK_INT >= 31 && blurRadius > .5f
+                && getWidth() > 0 && getHeight() > 0) {
+            // RenderNode lets each pane own its blur; hinge/shadow overlays remain crisp.
+            blurNode.setPosition(0, 0, getWidth(), getHeight());
+            RecordingCanvas recording = blurNode.beginRecording(getWidth(), getHeight());
+            recording.drawBitmap(b, src, dst, imagePaint);
+            blurNode.endRecording();
+            blurNode.setRenderEffect(blurEffect(blurRadius));
+            c.drawRenderNode(blurNode);
+            blurNode.setRenderEffect(null);
+        } else {
+            c.drawBitmap(b, src, dst, imagePaint);
+        }
         imagePaint.setAlpha(255);
     }
 
     @Override protected void onDetachedFromWindow() {
-        if (Build.VERSION.SDK_INT >= 31) imagePaint.setRenderEffect(null);
+        if (Build.VERSION.SDK_INT >= 31) blurNode.setRenderEffect(null);
         super.onDetachedFromWindow();
     }
 }
